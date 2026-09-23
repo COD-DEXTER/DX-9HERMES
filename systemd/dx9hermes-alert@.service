@@ -1,0 +1,7 @@
+[Unit]
+Description=DX9HERMES failure alert for %I
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/dx9hermes/hermes.env
+ExecStart=/opt/dx9hermes/scripts/alert.sh %I

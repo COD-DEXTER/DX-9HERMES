@@ -1,0 +1,297 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DX9_HOME="/opt/dx9hermes"
+# shellcheck source=../lib/ui.sh
+source "$DX9_HOME/lib/ui.sh"
+
+# BUG FIX: every action below used to shell out through `sudo`, but a lot of
+# minimal Debian VPS/cloud images (this box included) don't ship a `sudo`
+# binary at all when the default/only account is already root — every menu
+# action then failed with "sudo: command not found". main.sh already
+# requires root before it ever hands off to this CLI, so there's nothing for
+# sudo to do here; enforce that same root requirement directly (in case this
+# is ever launched on its own) and run everything without sudo.
+[ "$(id -u)" -eq 0 ] || { echo "dx9hermes must run as root (it manages systemd services, /etc, /opt)." >&2; exit 1; }
+
+CONF_DIR="/etc/dx9hermes"
+ROUTER_ENV="$CONF_DIR/9router.env"
+HERMES_ENV="$CONF_DIR/hermes.env"
+
+pause() { read -rp "Press Enter to return to the menu..." _; }
+
+action_install()      { bash "$DX9_HOME/install.sh"; pause; }
+
+action_status() {
+  systemctl status 9router --no-pager -l || true
+  systemctl status hermes-gateway --no-pager -l || true
+  echo
+  echo -n "9Router API health: "
+  if curl -fsS -m 3 http://127.0.0.1:20128/v1/models >/dev/null 2>&1; then
+    printf "${C_GREEN}reachable${C_RESET}\n"
+  else
+    printf "${C_RED}not reachable${C_RESET}\n"
+  fi
+  pause
+}
+
+action_test_telegram() {
+  # shellcheck disable=SC1090
+  source "$HERMES_ENV"
+  RESP=$(curl -fsS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" || true)
+  echo "$RESP"
+  pause
+}
+
+action_remove() {
+  read -rp "This will stop and remove DX9HERMES services, binaries and system users. Type 'yes' to confirm: " c
+  [ "$c" = "yes" ] || { echo "Cancelled."; pause; return; }
+  systemctl disable --now 9router hermes-gateway cloudflared caddy caddy-cftunnel 2>/dev/null || true
+  rm -f /etc/systemd/system/{9router,hermes-gateway,cloudflared,caddy,caddy-cftunnel}.service
+  systemctl daemon-reload
+  rm -f /usr/local/bin/caddy /usr/local/bin/cloudflared
+  userdel dx9hermes 2>/dev/null || true
+  userdel caddy 2>/dev/null || true
+  echo "Services, systemd units, downloaded binaries and system users removed."
+  echo "Config in $CONF_DIR and data in /var/lib/9router were deliberately left in place;"
+  echo "delete them manually (rm -rf $CONF_DIR /var/lib/9router) if you also want to wipe"
+  echo "configuration and secrets."
+  pause
+}
+
+action_switch_domain() {
+  read -rp "Cloudflare API token: " tok
+  read -rp "Zone (e.g. example.com): " zone
+  read -rp "Subdomain (e.g. 9router): " sub
+  bash "$DX9_HOME/scripts/cf-tunnel.sh" create --token "$tok" --zone "$zone" --subdomain "$sub"
+  pause
+}
+
+action_manage_access()  { bash "$DX9_HOME/scripts/manage-access.sh"; pause; }
+
+action_change_model() {
+  bash "$DX9_HOME/scripts/configure-hermes-model.sh"
+  pause
+}
+
+action_reconfigure_provider() {
+  echo "Free-provider names in 9Router change over time — there's no reliable"
+  echo "API/CLI for 'connect a no-auth provider' to script this step safely."
+  echo "Open the dashboard's Providers page, confirm which no-auth free option"
+  echo "is currently live, and click Connect."
+  echo
+  echo "Once that's done, come back here and run option 7 (Change Model) to"
+  echo "point Hermes at whatever 9Router now reports in /v1/models."
+  pause
+}
+
+action_change_port() {
+  local current_port
+  current_port="$(grep '^PORT=' "$ROUTER_ENV" 2>/dev/null | cut -d= -f2)"
+  read -rp "New port for 9Router [current: ${current_port:-20128}]: " newport
+  [ -n "$newport" ] || { pause; return; }
+  if ! [[ "$newport" =~ ^[0-9]+$ ]] || [ "$newport" -lt 1 ] || [ "$newport" -gt 65535 ]; then
+    echo "Invalid port: '$newport' (must be a number between 1 and 65535)."
+    pause; return
+  fi
+
+  sed -i "s/^PORT=.*/PORT=${newport}/" "$ROUTER_ENV"
+
+  # Hermes and any active Caddy front (bare-IP or Cloudflare-tunnel) call
+  # 9Router directly at 127.0.0.1:<old-port> — update every one of them, or
+  # they silently keep talking to the old port after 9Router has moved.
+  [ -f "$HERMES_ENV" ] && sed -i "s#OPENAI_BASE_URL=http://127\.0\.0\.1:[0-9]\+#OPENAI_BASE_URL=http://127.0.0.1:${newport}#" "$HERMES_ENV"
+  [ -f /etc/caddy/Caddyfile ] && sed -i "s/127\.0\.0\.1:[0-9]\+/127.0.0.1:${newport}/g" /etc/caddy/Caddyfile
+  [ -f /etc/caddy/Caddyfile.cftunnel ] && sed -i "s/127\.0\.0\.1:[0-9]\+/127.0.0.1:${newport}/g" /etc/caddy/Caddyfile.cftunnel
+
+  systemctl restart 9router
+  systemctl restart hermes-gateway 2>/dev/null || true
+  systemctl reload caddy 2>/dev/null || systemctl restart caddy 2>/dev/null || true
+  systemctl reload caddy-cftunnel 2>/dev/null || systemctl restart caddy-cftunnel 2>/dev/null || true
+
+  echo "9Router now listening on 127.0.0.1:${newport}. Hermes and any active Caddy front were updated to match and restarted."
+  pause
+}
+
+action_restart()   { systemctl restart 9router hermes-gateway; echo "Restarted."; pause; }
+action_logs()      { journalctl -u 9router -u hermes-gateway -n 100 --no-pager; pause; }
+
+action_backup() {
+  local out="/root/dx9hermes-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+  read -rsp "Passphrase to encrypt the backup (leave empty for no encryption): " pass; echo
+  if [ -n "$pass" ]; then
+    tar czf - "$CONF_DIR" | openssl enc -aes-256-cbc -pbkdf2 -salt -pass pass:"$pass" -out "${out}.enc"
+    echo "Encrypted backup written to ${out}.enc"
+  else
+    tar czf "$out" "$CONF_DIR"
+    echo "Backup written to $out (unencrypted)."
+  fi
+  pause
+}
+
+action_restore() {
+  read -rp "Path to backup file (.tar.gz or .tar.gz.enc): " src
+  [ -f "$src" ] || { echo "File not found: $src"; pause; return; }
+
+  read -rp "This overwrites the CURRENT config in $CONF_DIR and restarts services. Type 'yes' to confirm: " c
+  [ "$c" = "yes" ] || { echo "Cancelled."; pause; return; }
+
+  local tmp; tmp="$(mktemp -d)"
+  if [[ "$src" == *.enc ]]; then
+    read -rsp "Passphrase used to encrypt this backup: " pass; echo
+    if ! openssl enc -d -aes-256-cbc -pbkdf2 -salt -pass pass:"$pass" -in "$src" | tar xzf - -C "$tmp"; then
+      echo "Decryption or extraction failed — wrong passphrase or corrupt file. Nothing was changed."
+      rm -rf "$tmp"; pause; return
+    fi
+  else
+    if ! tar xzf "$src" -C "$tmp"; then
+      echo "Extraction failed — corrupt or unrelated archive. Nothing was changed."
+      rm -rf "$tmp"; pause; return
+    fi
+  fi
+
+  local extracted="$tmp${CONF_DIR}"
+  if [ ! -d "$extracted" ]; then
+    echo "This doesn't look like a DX9HERMES backup (expected a $CONF_DIR directory inside it)."
+    rm -rf "$tmp"; pause; return
+  fi
+
+  systemctl stop 9router hermes-gateway 2>/dev/null || true
+  rm -rf "$CONF_DIR"
+  cp -a "$extracted" "$CONF_DIR"
+  rm -rf "$tmp"
+  systemctl restart 9router hermes-gateway
+  echo "Config restored from $src and services restarted."
+  pause
+}
+
+action_backup_restore() {
+  echo "1) Backup current config"
+  echo "2) Restore config from a backup file"
+  read -rp "Choose: " br
+  case "$br" in
+    1) action_backup ;;
+    2) action_restore ;;
+    *) echo "Cancelled."; pause ;;
+  esac
+}
+
+action_reset() {
+  read -rp "This wipes DX9HERMES config and re-runs install. Type 'yes' to confirm: " c
+  [ "$c" = "yes" ] || { pause; return; }
+
+  if [ ! -f "$HERMES_ENV" ]; then
+    echo "No existing config found at $HERMES_ENV — nothing to reset yet."
+    echo "Use option 1 (Install) instead."
+    pause; return
+  fi
+
+  # install.sh is intentionally non-interactive and only reads these from the
+  # environment. Recover them from the CURRENT install before wiping
+  # anything, or the reinstall below is guaranteed to fail on a missing
+  # TELEGRAM_BOT_TOKEN and leave the box with no config and no running
+  # services (BUG-004).
+  # shellcheck disable=SC1090
+  source "$HERMES_ENV"
+  local cur_token="${TELEGRAM_BOT_TOKEN:-}" cur_owner="${TELEGRAM_OWNER_ID:-}"
+  local cur_extra=""
+  if [ -n "${TELEGRAM_ALLOWED_USERS:-}" ] && [ -n "$cur_owner" ]; then
+    # TELEGRAM_ALLOWED_USERS is "owner,extra1,extra2,..." — strip the owner
+    # back out so we don't feed install.sh a doubled-up ID list.
+    cur_extra="$(echo ",$TELEGRAM_ALLOWED_USERS," | sed "s/,${cur_owner},/,/" | sed 's/^,//;s/,$//')"
+  fi
+
+  echo "Reusing current Telegram bot token and owner ID ($cur_owner) unless you say otherwise."
+  read -rp "Keep these? [Y/n]: " keep
+  if [ "${keep,,}" = "n" ]; then
+    read -rp "New Telegram bot token: " cur_token
+    read -rp "New Telegram owner ID: " cur_owner
+    read -rp "Extra allowed IDs (comma-separated, optional): " cur_extra
+  fi
+
+  local cf_token="" cf_zone="" cf_sub=""
+  if [ -f "$CONF_DIR/access_mode" ] && grep -q "Cloudflare" "$CONF_DIR/access_mode" 2>/dev/null; then
+    echo "Current access mode is Cloudflare Tunnel. The Cloudflare API token is"
+    echo "never stored on disk, so it's needed again to re-set up the tunnel."
+    read -rp "Cloudflare API token (leave empty to fall back to the bare-IP/Caddy path instead): " cf_token
+    if [ -n "$cf_token" ]; then
+      local prev_domain=""; [ -f "$CONF_DIR/dashboard_domain" ] && prev_domain="$(cat "$CONF_DIR/dashboard_domain")"
+      read -rp "Zone (e.g. example.com) [${prev_domain#*.}]: " cf_zone
+      cf_zone="${cf_zone:-${prev_domain#*.}}"
+      read -rp "Subdomain (e.g. 9router) [${prev_domain%%.*}]: " cf_sub
+      cf_sub="${cf_sub:-${prev_domain%%.*}}"
+    fi
+  fi
+
+  rm -rf "$CONF_DIR"
+  if [ -n "$cf_token" ]; then
+    TELEGRAM_BOT_TOKEN="$cur_token" TELEGRAM_OWNER_ID="$cur_owner" TELEGRAM_ALLOWED_IDS="$cur_extra" \
+      CLOUDFLARE_API_TOKEN="$cf_token" CF_ZONE="$cf_zone" CF_SUBDOMAIN="$cf_sub" \
+      bash "$DX9_HOME/install.sh"
+  else
+    TELEGRAM_BOT_TOKEN="$cur_token" TELEGRAM_OWNER_ID="$cur_owner" TELEGRAM_ALLOWED_IDS="$cur_extra" \
+      bash "$DX9_HOME/install.sh"
+  fi
+  pause
+}
+
+action_switch_mode() {
+  echo "1) Direct IP + Caddy"
+  echo "2) Cloudflare Tunnel"
+  read -rp "Choose: " m
+  case "$m" in
+    1) echo "Direct IP + Caddy" | tee "$CONF_DIR/access_mode" >/dev/null ;;
+    2) action_switch_domain ;;
+  esac
+  pause
+}
+
+action_update()   { bash "$DX9_HOME/scripts/update.sh"; pause; }
+
+action_about() {
+  echo "DX9HERMES v${DX9_VERSION} — Hermes Agent + 9Router turnkey deployment."
+  echo "Creator: ${DX9_CREATOR}"
+  pause
+}
+
+run_action() {
+  # A command that is the condition of an `if` is exempt from `set -e`, so a
+  # failure anywhere inside the action (missing env file, failed curl, a
+  # missing binary, ...) lands back here instead of killing the whole menu
+  # process (BUG-005).
+  if ! "$@"; then
+    echo
+    printf "${C_RED}That action failed or isn't available yet (e.g. install hasn't run). Returning to the menu.${C_RESET}\n"
+    pause
+  fi
+}
+
+main() {
+  while true; do
+    clear
+    dx9_banner
+    dx9_menu
+    read -rp "> " choice
+    case "$choice" in
+      1) run_action action_install ;;
+      2) run_action action_status ;;
+      3) run_action action_test_telegram ;;
+      4) run_action action_remove ;;
+      5) run_action action_switch_domain ;;
+      6) run_action action_manage_access ;;
+      7) run_action action_change_model ;;
+      8) run_action action_reconfigure_provider ;;
+      9) run_action action_change_port ;;
+      10) run_action action_restart ;;
+      11) run_action action_logs ;;
+      12) run_action action_backup_restore ;;
+      13) run_action action_reset ;;
+      14) run_action action_switch_mode ;;
+      15) run_action action_update ;;
+      16) run_action action_about ;;
+      0) exit 0 ;;
+      *) echo "Invalid choice."; sleep 1 ;;
+    esac
+  done
+}
+main "$@"

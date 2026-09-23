@@ -1,0 +1,29 @@
+# TEMPLATE — do not install this file directly. ExecStart= below is a
+# placeholder; install.sh's install_hermes_unit() rewrites it to the
+# absolute path of the hermes binary installed for the dx9hermes service
+# user (recorded in /etc/dx9hermes/hermes_bin_path) before copying it to
+# /etc/systemd/system/. A raw `cp` of this file will fail — hermes is
+# installed per-user under ~/.local/bin, not on systemd's default PATH.
+[Unit]
+Description=Hermes Agent - Telegram gateway (DX9HERMES)
+After=network-online.target 9router.service
+Wants=network-online.target 9router.service
+# BUG-FIX: OnFailure= belongs in [Unit], not [Service] — systemd silently
+# drops it from [Service] (see 9router.service for the confirming journalctl
+# line), so dx9hermes-alert@.service never actually fired from here either.
+OnFailure=dx9hermes-alert@%n.service
+
+[Service]
+Type=simple
+User=dx9hermes
+Group=dx9hermes
+EnvironmentFile=/etc/dx9hermes/hermes.env
+ExecStart=/usr/bin/env hermes gateway start
+Restart=always
+RestartSec=3
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,129 @@
+# TEMPLATE — do not install this file directly. ExecStart= below is a
+# placeholder; install.sh's install_9router_unit() rewrites it to the
+# absolute path of the installed 9router binary before copying it to
+# /etc/systemd/system/. A raw `cp` of this file will fail with
+# "9router: command not found" under systemd's minimal PATH.
+#
+# BUG-FIX (crash-restart loop, restart counter climbing into the 70s/80s):
+# `9router` has NO `start` subcommand — 0.5.86's --help confirms the CLI only
+# parses flags (-p/-H/-n/-l/-t/--skip-update), never subcommands. `9router
+# start` therefore just launches the normal interactive flow, which — after
+# the server is up — always calls showInterfaceMenu() and blocks on a TTY
+# prompt UNLESS a non-interactive flag is set. Under systemd there's no TTY,
+# selectMenu() resolves instantly with nothing selected, the process exits
+# 0, and Restart=always spins it right back up: an infinite fast loop,
+# never actually serving on the port in between.
+#
+# BUG-FIX #2 (revised — real systemd run, not just a manual foreground test):
+# this unit previously used `--tray` instead of `--no-browser` to skip that
+# menu, based on reading cli.js's `if (trayMode) { ...; return; }` branch in
+# isolation. Manually running that exact command in a foreground shell DID
+# work (Next.js came up, listener bound, stayed up until Ctrl+C) — but under
+# systemd itself the unit's own journal showed "Router is now running in
+# system tray." + "Next.js Ready", followed by systemd marking the unit
+# Deactivated a few seconds later and Restart=always looping it again. A
+# manual shell has a session/TTY that a systemd service does not; `--tray`
+# is CLI shorthand for "run with a desktop system-tray icon" (a GUI
+# feature), and the leading theory — not yet re-confirmed against cli.js's
+# actual tray-init code path — is that the tray-icon setup that runs right
+# after the "Ready" log throws (no DISPLAY/DBUS session under systemd) and
+# takes the whole process down with it, after the server had already
+# logged Ready. `--no-browser` is the CLI's own flag for "don't try to open
+# a browser window" — i.e. the actual non-interactive/headless-server
+# intent, with no tray-icon code path involved — and systemd services get
+# stdin on /dev/null by default (not a TTY) regardless, which is what
+# should make selectMenu() resolve without a prompt even with neither flag;
+# --no-browser is kept anyway since it's the flag that documents that
+# intent. THIS HAS NOT BEEN CONFIRMED AGAINST A LIVE systemctl restart ON
+# THE REAL BOX — verify with:
+#   systemctl daemon-reload && systemctl restart 9router
+#   sleep 5 && systemctl status 9router --no-pager
+#   ss -lntp | grep ':20128'   # must show 127.0.0.1:20128, not 0.0.0.0
+#   curl -i --max-time 5 http://127.0.0.1:20128/v1/models
+# If it still deactivates after "Ready", capture `journalctl -u 9router -n
+# 80 --no-pager` from the moment it deactivates — that's the real error,
+# and cli.js's actual tray-init branch needs to be read on that box (not
+# guessed here) before touching this flag again.
+# Also pass --host/--port explicitly — HOSTNAME from EnvironmentFile is NOT
+# read by the CLI's arg parser (it only sets `host` from
+# `let host = DEFAULT_HOST` ["0.0.0.0"], overridden solely by -H/--host),
+# so without an explicit --host flag the server binds 0.0.0.0 regardless of
+# what 9router.env says.
+#
+# BUG-FIX #3 (confirmed on a live box: restart counter still climbing into
+# the 70s/80s with --no-browser in place). journalctl showed the exact
+# sequence BUG-FIX #2 predicted as the fallback theory: server "Ready",
+# "Router is now running in system tray" logged, then systemd reports
+# "Deactivated successfully" a few (variable: ~4-60) seconds later — a
+# CLEAN exit(0), not a crash/signal. That rules out the tray-icon-throws
+# theory (a throw would show a stack trace and/or a non-zero exit in
+# journalctl, and Type=simple would log "Main process exited, code=exited,
+# status=1/FAILURE", not "Deactivated successfully"). What's left, per the
+# original BUG-FIX note above, is cli.js's own post-Ready flow still
+# treating this as an interactive session and voluntarily exiting once
+# whatever it's waiting on (stdin close, a readline prompt, etc.) resolves
+# — systemd gives ExecStart a real process but stdin is /dev/null and
+# stdout/stderr are pipes to journald, none of which is a TTY, and no CLI
+# flag we've found (-p/-H/-n/-l/-t/--skip-update, confirmed exhaustive
+# against --help) turns that check off. The variable delay (not instant,
+# not fixed) is consistent with cli.js waiting on *something* tied to
+# stdin/output rather than failing a check immediately.
+# Fix: give it what a real terminal session provides. `script` (util-linux,
+# preinstalled on effectively every Linux base system incl. Alpine's
+# BusyBox — no new package to install) allocates a real pty for the child
+# and connects it to stdin/stdout/stderr, while `script` itself still
+# writes to *its own* stdout/stderr normally — which is what systemd
+# captures to the journal — so `journalctl -u 9router` keeps showing
+# 9Router's own log lines exactly as before. The trailing `/dev/null` is
+# the transcript file `script` would otherwise write (typescript of the
+# session); discarded since the live stdout passthrough already covers
+# that. `-c` is used instead of a bare trailing command because -q (quiet,
+# no "Script started/done" banner lines in the journal) is only valid
+# together with -c on some util-linux versions.
+# NOT YET RE-CONFIRMED on the real box — after deploying, verify with:
+#   systemctl daemon-reload && systemctl restart 9router
+#   sleep 10 && systemctl status 9router --no-pager   # counter must stop climbing
+#   journalctl -u 9router -n 50 --no-pager -l          # must NOT show another "Deactivated" after Ready
+#   ss -lntp | grep ':20128'                           # must show 127.0.0.1:20128
+#   curl -i --max-time 5 http://127.0.0.1:20128/v1/models
+# If it *still* exits after Ready, the CLI is voluntarily quitting for a
+# reason with no known flag workaround — pull the actual source
+# (`npm root -g`/9router/cli.js or dist/*.js, search for what runs right
+# after the "system tray" log line) instead of guessing at another flag.
+[Unit]
+Description=9Router - local OpenAI-compatible model router (DX9HERMES)
+After=network-online.target
+Wants=network-online.target
+# BUG-FIX: OnFailure= is a [Unit]-section directive, not [Service]. It used
+# to live below in [Service], where systemd silently drops it (confirmed:
+# journalctl logged "Unknown key 'OnFailure' in section [Service],
+# ignoring." on every start) — so dx9hermes-alert@.service was NEVER
+# actually triggered on crash, no matter how many times this unit
+# restart-looped. Moved here so failure alerts actually fire.
+OnFailure=dx9hermes-alert@%n.service
+
+[Service]
+Type=simple
+User=dx9hermes
+Group=dx9hermes
+EnvironmentFile=/etc/dx9hermes/9router.env
+# BUG-010 mitigation: some Node-based CLIs write cache/config under $HOME
+# regardless of an app-specific data-dir env var. ProtectSystem=strict only
+# allows writes under ReadWritePaths below, so point $HOME there too rather
+# than at the service user's real (read-only-to-this-unit) home dir. NOT
+# independently verified against a real 9Router install — if 9Router turns
+# out to fully respect DATA_DIR and never touches $HOME, this line is a
+# no-op; if it does, this is what keeps it from crash-looping.
+Environment=HOME=/var/lib/9router
+ExecStart=/usr/bin/script -qc "/usr/bin/env 9router --host 127.0.0.1 --port 20128 --no-browser --skip-update --log" /dev/null
+Restart=always
+RestartSec=3
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/9router
+
+[Install]
+WantedBy=multi-user.target
